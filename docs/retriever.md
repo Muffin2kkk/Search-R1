@@ -95,10 +95,11 @@ cat $save_path/part_* > $save_path/e5_HNSW64.index
 ```bash
 conda activate retriever
 
+save_path=/root/autodl-tmp/retrieval_materials
 index_file=$save_path/e5_HNSW64.index
 corpus_file=$save_path/wiki-18.jsonl
 retriever_name=e5
-retriever_path=intfloat/e5-base-v2
+retriever_path=/root/autodl-tmp/e5-base-v2
 
 python search_r1/search/retrieval_server.py --index_path $index_file --corpus_path $corpus_file --topk 3 --retriever_name $retriever_name --retriever_model $retriever_path
 ```

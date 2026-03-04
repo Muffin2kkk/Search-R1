@@ -49,7 +49,10 @@ if __name__ == '__main__':
 
     data_source = 'nq'
 
-    dataset = datasets.load_dataset('RUC-NLPIR/FlashRAG_datasets', 'nq')
+    dataset = datasets.load_dataset('json', data_files={
+        'train': 'data/FlashRAG_datasets/nq/train.jsonl',
+        'test': 'data/FlashRAG_datasets/nq/test.jsonl'
+    })
 
     train_dataset = dataset['train']
     test_dataset = dataset['test']

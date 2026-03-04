@@ -4,8 +4,16 @@ import warnings
 from typing import List, Dict, Optional
 import argparse
 
-import faiss
+# Set HF cache and temp directories to data disk (must be before datasets import)
+os.environ["HF_HOME"] = "/root/autodl-tmp/hf_cache"
+os.environ["HF_DATASETS_CACHE"] = "/root/autodl-tmp/hf_cache/datasets"
+os.environ["HF_HUB_CACHE"] = "/root/autodl-tmp/hf_cache/hub"
+os.environ["TMPDIR"] = "/root/autodl-tmp/tmp"
+os.makedirs(os.environ["HF_DATASETS_CACHE"], exist_ok=True)
+os.makedirs(os.environ["HF_HUB_CACHE"], exist_ok=True)
+os.makedirs(os.environ["TMPDIR"], exist_ok=True)
 import torch
+import faiss
 import numpy as np
 from transformers import AutoConfig, AutoTokenizer, AutoModel
 from tqdm import tqdm
@@ -20,7 +28,8 @@ def load_corpus(corpus_path: str):
         'json', 
         data_files=corpus_path,
         split="train",
-        num_proc=4
+        num_proc=4,
+        cache_dir=os.environ["HF_DATASETS_CACHE"],
     )
     return corpus
 
@@ -361,17 +370,18 @@ def retrieve_endpoint(request: QueryRequest):
 if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="Launch the local faiss retriever.")
-    parser.add_argument("--index_path", type=str, default="/home/peterjin/mnt/index/wiki-18/e5_Flat.index", help="Corpus indexing file.")
-    parser.add_argument("--corpus_path", type=str, default="/home/peterjin/mnt/data/retrieval-corpus/wiki-18.jsonl", help="Local corpus file.")
+    parser.add_argument("--index_path", type=str, default="/root/autodl-tmp/retrieval_materials/e5_HNSW64.index", help="Corpus indexing file.")
+    parser.add_argument("--corpus_path", type=str, default="/root/autodl-tmp/retrieval_materials/wiki-18.jsonl", help="Local corpus file.")
     parser.add_argument("--topk", type=int, default=3, help="Number of retrieved passages for one query.")
     parser.add_argument("--retriever_name", type=str, default="e5", help="Name of the retriever model.")
-    parser.add_argument("--retriever_model", type=str, default="intfloat/e5-base-v2", help="Path of the retriever model.")
+    parser.add_argument("--retriever_model", type=str, default="/root/autodl-tmp/e5-base-v2", help="Path of the retriever model.")
     parser.add_argument('--faiss_gpu', action='store_true', help='Use GPU for computation')
 
     args = parser.parse_args()
     
     # 1) Build a config (could also parse from arguments).
     #    In real usage, you'd parse your CLI arguments or environment variables.
+    print("Initializing configuration...")
     config = Config(
         retrieval_method = args.retriever_name,  # or "dense"
         index_path=args.index_path,
@@ -386,7 +396,9 @@ if __name__ == "__main__":
     )
 
     # 2) Instantiate a global retriever so it is loaded once and reused.
+    print(f"Loading FAISS index, corpus, and model ({args.retriever_model}). This may take a while...")
     retriever = get_retriever(config)
     
     # 3) Launch the server. By default, it listens on http://127.0.0.1:8000
+    print("Retriever loaded successfully! Starting Uvicorn server on http://0.0.0.0:8000 ...")
     uvicorn.run(app, host="0.0.0.0", port=8000)

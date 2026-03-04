@@ -33,10 +33,11 @@ class RewardManager():
     """The reward manager.
     """
 
-    def __init__(self, tokenizer, num_examine, format_score=0.) -> None:
+    def __init__(self, tokenizer, num_examine, format_score=0., log_file=None) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.format_score = format_score
+        self.log_file = log_file
 
     def __call__(self, data: DataProto):
         """We will expand this function gradually based on the available datasets"""
@@ -47,9 +48,8 @@ class RewardManager():
 
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
 
-        # all_scores = []
-
         already_print_data_sources = {}
+        records_to_log = []
 
         for i in range(len(data)):
             data_item = data[i]  # DataProtoItem
@@ -78,7 +78,17 @@ class RewardManager():
             score = compute_score_fn(solution_str=sequences_str, ground_truth=ground_truth, format_score=self.format_score)
 
             reward_tensor[i, valid_response_length - 1] = score
-            # all_scores.append(score)
+            
+            if self.log_file:
+                # Convert numpy arrays to native Python types for JSON serialization
+                data_source_val = data_source.item() if hasattr(data_source, 'item') else str(data_source)
+                ground_truth_val = ground_truth.item() if hasattr(ground_truth, 'item') else str(ground_truth)
+                records_to_log.append({
+                    "data_source": data_source_val,
+                    "ground_truth": ground_truth_val,
+                    "model_response": sequences_str,
+                    "score": float(score)
+                })
 
             if data_source not in already_print_data_sources:
                 already_print_data_sources[data_source] = 0
@@ -87,12 +97,13 @@ class RewardManager():
                 already_print_data_sources[data_source] += 1
                 print(sequences_str)
         
-        # print(f"[DEBUG] all_scores: {all_scores}")
-        # print(f"[DEBUG] all_scores shape: {np.array(all_scores).shape}")
-        # print(f"[DEBUG] all_scores mean: {np.mean(all_scores)}")
-        # print(f"[DEBUG] all_scores max: {np.max(all_scores)}")
-        # print(f"[DEBUG] all_scores min: {np.min(all_scores)}")
-        # print(f"[DEBUG] all_scores std: {np.std(all_scores)}")
+        if self.log_file and len(records_to_log) > 0:
+            import json
+            import os
+            os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
+            with open(self.log_file, "a") as f:
+                for record in records_to_log:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
         return reward_tensor
 
@@ -180,10 +191,12 @@ def main_task(config):
         role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
         mapping[Role.RewardModel] = global_pool_id
 
-    reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0)
+    reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0, 
+                              log_file=f'/root/autodl-tmp/rollouts/{config.trainer.experiment_name}_train_rollouts.jsonl')
 
     # Note that we always use function-based RM for validation
-    val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1)
+    val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1,
+                                  log_file=f'/root/autodl-tmp/rollouts/{config.trainer.experiment_name}_val_rollouts.jsonl')
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
     trainer = RayPPOTrainer(config=config,

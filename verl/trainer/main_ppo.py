@@ -21,6 +21,9 @@ from verl.utils.reward_score import qa_em
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 import re
 import numpy as np
+import glob
+import os
+import time
 
 def _select_rm_score_fn(data_source):
     if data_source in ['nq', 'triviaqa', 'popqa', 'hotpotqa', '2wikimultihopqa', 'musique', 'bamboogle']:
@@ -29,15 +32,57 @@ def _select_rm_score_fn(data_source):
         raise NotImplementedError
 
 
+def _normalize_sample_identifier(value):
+    if hasattr(value, 'item'):
+        value = value.item()
+    if value is None:
+        return None
+    if isinstance(value, float) and np.isnan(value):
+        return None
+    value = str(value).strip()
+    if value == '' or value.lower() in {'none', 'nan'}:
+        return None
+    return value
+
+
+def _make_sample_key(uid=None, index=None):
+    normalized_uid = _normalize_sample_identifier(uid)
+    if normalized_uid is not None:
+        return f'uid:{normalized_uid}'
+    normalized_index = _normalize_sample_identifier(index)
+    if normalized_index is not None:
+        return f'index:{normalized_index}'
+    return None
+
+
+def _resolve_rollouts_dir(config, inference_only: bool):
+    configured_dir = config.trainer.get('rollouts_dir', None)
+    if configured_dir not in (None, '', 'null'):
+        return configured_dir
+
+    resume_inference = inference_only and bool(config.trainer.get('resume_inference', False))
+    if resume_inference:
+        pattern = f"/root/autodl-tmp/rollouts/{config.trainer.experiment_name}_*"
+        candidates = [path for path in glob.glob(pattern) if os.path.isdir(path)]
+        if candidates:
+            latest_dir = max(candidates, key=os.path.getmtime)
+            print(f"Resuming inference from existing rollouts dir: {latest_dir}")
+            return latest_dir
+
+    time_str = time.strftime("%Y%m%d_%H%M%S")
+    return f'/root/autodl-tmp/rollouts/{config.trainer.experiment_name}_{time_str}'
+
+
 class RewardManager():
     """The reward manager.
     """
 
-    def __init__(self, tokenizer, num_examine, format_score=0., log_file=None) -> None:
+    def __init__(self, tokenizer, num_examine, format_score=0., log_file=None, split_name=None) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.format_score = format_score
         self.log_file = log_file
+        self.split_name = split_name
 
     def __call__(self, data: DataProto):
         """We will expand this function gradually based on the available datasets"""
@@ -66,6 +111,8 @@ class RewardManager():
             valid_response_ids = response_ids[:valid_response_length]
 
             # decode
+            prompt_str = self.tokenizer.decode(valid_prompt_ids)
+            response_str = self.tokenizer.decode(valid_response_ids)
             sequences = torch.cat((valid_prompt_ids, valid_response_ids))
             sequences_str = self.tokenizer.decode(sequences)
 
@@ -83,10 +130,21 @@ class RewardManager():
                 # Convert numpy arrays to native Python types for JSON serialization
                 data_source_val = data_source.item() if hasattr(data_source, 'item') else str(data_source)
                 ground_truth_val = ground_truth.item() if hasattr(ground_truth, 'item') else str(ground_truth)
+                index = data_item.non_tensor_batch['index'] if 'index' in data_item.non_tensor_batch else None
+                uid = data_item.non_tensor_batch['uid'] if 'uid' in data_item.non_tensor_batch else None
+                index_val = index.item() if hasattr(index, 'item') else index
+                uid_val = uid.item() if hasattr(uid, 'item') else uid
+                sample_key = _make_sample_key(uid=uid_val, index=index_val)
                 records_to_log.append({
+                    "split": self.split_name,
+                    "index": index_val,
+                    "uid": uid_val,
+                    "sample_key": sample_key,
                     "data_source": data_source_val,
                     "ground_truth": ground_truth_val,
-                    "model_response": sequences_str,
+                    "prompt": prompt_str,
+                    "response": response_str,
+                    "full_sequence": sequences_str,
                     "score": float(score)
                 })
 
@@ -125,10 +183,10 @@ def main(config):
 def main_task(config):
     from verl.utils.fs import copy_local_path_from_hdfs
     from transformers import AutoTokenizer
+    from omegaconf import OmegaConf, open_dict
 
     # print initial config
     from pprint import pprint
-    from omegaconf import OmegaConf
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
     OmegaConf.resolve(config)
 
@@ -159,21 +217,25 @@ def main_task(config):
 
     from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
-    role_worker_mapping = {
-        Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
-        Role.Critic: ray.remote(CriticWorker),
-        Role.RefPolicy: ray.remote(ActorRolloutRefWorker),
-    }
-
     global_pool_id = 'global_pool'
     resource_pool_spec = {
         global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
     }
-    mapping = {
-        Role.ActorRollout: global_pool_id,
-        Role.Critic: global_pool_id,
-        Role.RefPolicy: global_pool_id,
+    inference_only = bool(config.trainer.get('inference_only', False))
+    rollout_role = Role.Rollout if inference_only else Role.ActorRollout
+
+    role_worker_mapping = {
+        rollout_role: ray.remote(ActorRolloutRefWorker),
     }
+    mapping = {
+        rollout_role: global_pool_id,
+    }
+
+    if not inference_only:
+        role_worker_mapping[Role.Critic] = ray.remote(CriticWorker)
+        role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
+        mapping[Role.Critic] = global_pool_id
+        mapping[Role.RefPolicy] = global_pool_id
 
     # we should adopt a multi-source reward function here
     # - for rule-based rm, we directly call a reward score
@@ -181,7 +243,7 @@ def main_task(config):
     # - for code related prompt, we send to a sandbox if there are test cases
     # - finally, we combine all the rewards together
     # - The reward type depends on the tag of the data
-    if config.reward_model.enable:
+    if config.reward_model.enable and not inference_only:
         if config.reward_model.strategy == 'fsdp':
             from verl.workers.fsdp_workers import RewardModelWorker
         elif config.reward_model.strategy == 'megatron':
@@ -191,12 +253,22 @@ def main_task(config):
         role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
         mapping[Role.RewardModel] = global_pool_id
 
+    rollouts_dir = _resolve_rollouts_dir(config, inference_only=inference_only)
+    os.makedirs(rollouts_dir, exist_ok=True)
+    with open_dict(config):
+        config.trainer.rollouts_dir = rollouts_dir
+
+    train_rollout_log = os.path.join(rollouts_dir, 'train_rollouts.jsonl' if inference_only else 'epoch_0_rollouts.jsonl')
+    val_rollout_log = os.path.join(rollouts_dir, 'test_rollouts.jsonl' if inference_only else 'val_rollouts.jsonl')
+
     reward_fn = RewardManager(tokenizer=tokenizer, num_examine=0, 
-                              log_file=f'/root/autodl-tmp/rollouts/{config.trainer.experiment_name}_train_rollouts.jsonl')
+                              log_file=train_rollout_log,
+                              split_name='train')
 
     # Note that we always use function-based RM for validation
     val_reward_fn = RewardManager(tokenizer=tokenizer, num_examine=1,
-                                  log_file=f'/root/autodl-tmp/rollouts/{config.trainer.experiment_name}_val_rollouts.jsonl')
+                                  log_file=val_rollout_log,
+                                  split_name='test' if inference_only else 'val')
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
     trainer = RayPPOTrainer(config=config,

@@ -12,6 +12,7 @@ from tqdm import tqdm
 # from LongRAG.retriever.utils import load_model, load_corpus, pooling
 import datasets
 from transformers import AutoTokenizer, AutoModel, AutoConfig
+from search_r1.search.corpus_loader import load_corpus
 
 
 def load_model(
@@ -46,15 +47,6 @@ def pooling(
         raise NotImplementedError("Pooling method not implemented!")
 
 
-def load_corpus(corpus_path: str):
-    corpus = datasets.load_dataset(
-            'json', 
-            data_files=corpus_path,
-            split="train",
-            num_proc=4)
-    return corpus
-
-
 class Index_Builder:
     r"""A tool class used to build an index used in retrieval.
     
@@ -64,6 +56,7 @@ class Index_Builder:
             retrieval_method,
             model_path,
             corpus_path,
+            arrow_corpus_dir,
             save_dir,
             max_length,
             batch_size,
@@ -78,6 +71,7 @@ class Index_Builder:
         self.retrieval_method = retrieval_method.lower()
         self.model_path = model_path
         self.corpus_path = corpus_path
+        self.arrow_corpus_dir = arrow_corpus_dir
         self.save_dir = save_dir
         self.max_length = max_length
         self.batch_size = batch_size
@@ -101,7 +95,11 @@ class Index_Builder:
 
         self.embedding_save_path = os.path.join(self.save_dir, f"emb_{self.retrieval_method}.memmap")
 
-        self.corpus = load_corpus(self.corpus_path)
+        self.corpus = load_corpus(
+            corpus_path=self.corpus_path,
+            arrow_dir=self.arrow_corpus_dir,
+            allow_json_fallback=False,
+        )
        
         print("Finish loading...")
     @staticmethod
@@ -301,6 +299,7 @@ def main():
     parser.add_argument('--retrieval_method', type=str)
     parser.add_argument('--model_path', type=str, default=None)
     parser.add_argument('--corpus_path', type=str)
+    parser.add_argument('--arrow_corpus_dir', type=str, default=None)
     parser.add_argument('--save_dir', default= 'indexes/',type=str)
 
     # Parameters for building dense index
@@ -332,6 +331,7 @@ def main():
                         retrieval_method = args.retrieval_method,
                         model_path = args.model_path,
                         corpus_path = args.corpus_path,
+                        arrow_corpus_dir = args.arrow_corpus_dir,
                         save_dir = args.save_dir,
                         max_length = args.max_length,
                         batch_size = args.batch_size,

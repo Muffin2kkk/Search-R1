@@ -4,6 +4,7 @@ data:
   val_files: ~/data/rlhf/gsm8k/test.parquet
   train_data_num: null
   val_data_num: null
+  inference_batch_size: null
   prompt_key: prompt
   max_prompt_length: 512
   max_response_length: 512
@@ -173,6 +174,9 @@ trainer:
   save_freq: -1
   test_freq: -1
   critic_warmup: 0
+  inference_only: False
+  inference_splits: [ 'train', 'test' ]
+  rollouts_dir: null
   default_hdfs_dir: ~/experiments/gsm8k/ppo/${trainer.experiment_name}
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
 

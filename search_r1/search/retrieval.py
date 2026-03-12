@@ -11,15 +11,7 @@ import numpy as np
 from transformers import AutoConfig, AutoTokenizer, AutoModel
 import argparse
 import datasets
-
-
-def load_corpus(corpus_path: str):
-    corpus = datasets.load_dataset(
-            'json', 
-            data_files=corpus_path,
-            split="train",
-            num_proc=4)
-    return corpus
+from search_r1.search.corpus_loader import load_corpus
     
 
 def read_jsonl(file_path):
@@ -139,8 +131,16 @@ class BaseRetriever:
         
         self.index_path = config.index_path
         self.corpus_path = config.corpus_path
+        self.arrow_corpus_dir = getattr(config, "arrow_corpus_dir", None)
 
         # self.cache_save_path = os.path.join(config.save_dir, 'retrieval_cache.json')
+
+    def _load_corpus(self):
+        return load_corpus(
+            corpus_path=self.corpus_path,
+            arrow_dir=self.arrow_corpus_dir,
+            allow_json_fallback=False,
+        )
 
     def _search(self, query: str, num: int, return_score:bool) -> List[Dict[str, str]]:
         r"""Retrieve topk relevant documents in corpus.
@@ -171,7 +171,7 @@ class BM25Retriever(BaseRetriever):
         self.searcher = LuceneSearcher(self.index_path)
         self.contain_doc = self._check_contain_doc()
         if not self.contain_doc:
-            self.corpus = load_corpus(self.corpus_path)
+            self.corpus = self._load_corpus()
         self.max_process_num = 8
         
     def _check_contain_doc(self):
@@ -246,7 +246,7 @@ class DenseRetriever(BaseRetriever):
             self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
             # self.index = faiss.index_cpu_to_all_gpus(self.index)
 
-        self.corpus = load_corpus(self.corpus_path)
+        self.corpus = self._load_corpus()
         self.encoder = Encoder(
              model_name = self.retrieval_method, 
              model_path = config.retrieval_model_path,
@@ -339,6 +339,7 @@ if __name__ == '__main__':
     parser.add_argument('--retrieval_topk', type=int, default=10)
     parser.add_argument('--index_path', type=str, default=None)
     parser.add_argument('--corpus_path', type=str)
+    parser.add_argument('--arrow_corpus_dir', type=str, default=None)
     parser.add_argument('--dataset_path', default=None, type=str)
 
     parser.add_argument('--faiss_gpu', default=True, type=bool)

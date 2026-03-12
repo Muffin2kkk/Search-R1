@@ -1,8 +1,12 @@
 import json
+import logging
 import os
+import sys
 import warnings
 from typing import List, Dict, Optional
 import argparse
+import time
+import uuid
 
 # Set HF cache and temp directories to data disk (must be before datasets import)
 os.environ["HF_HOME"] = "/root/autodl-tmp/hf_cache"
@@ -12,26 +16,180 @@ os.environ["TMPDIR"] = "/root/autodl-tmp/tmp"
 os.makedirs(os.environ["HF_DATASETS_CACHE"], exist_ok=True)
 os.makedirs(os.environ["HF_HUB_CACHE"], exist_ok=True)
 os.makedirs(os.environ["TMPDIR"], exist_ok=True)
+
+DEBUG_MODE_LOG_PATH = "/root/.cursor/debug.log"
+
+
+def _append_debug_mode_log(hypothesis_id: str, location: str, message: str, data: dict):
+    payload = {
+        "id": f"log_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}",
+        "timestamp": int(time.time() * 1000),
+        "location": location,
+        "message": message,
+        "data": data,
+        "runId": "retrieval-server-import-debug",
+        "hypothesisId": hypothesis_id,
+    }
+    with open(DEBUG_MODE_LOG_PATH, "a") as f:
+        f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+
+
+PROJECT_ROOT_FOR_IMPORT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if PROJECT_ROOT_FOR_IMPORT not in sys.path:
+    # region agent log
+    _append_debug_mode_log(
+        "H1",
+        "search_r1/search/retrieval_server.py:35",
+        "Inserted project root into sys.path for script execution.",
+        {
+            "project_root": PROJECT_ROOT_FOR_IMPORT,
+            "sys_path_head_before": sys.path[:5],
+        },
+    )
+    # endregion
+    sys.path.insert(0, PROJECT_ROOT_FOR_IMPORT)
+    # region agent log
+    _append_debug_mode_log(
+        "H1",
+        "search_r1/search/retrieval_server.py:46",
+        "Project root inserted into sys.path.",
+        {
+            "project_root": PROJECT_ROOT_FOR_IMPORT,
+            "sys_path_head_after": sys.path[:5],
+        },
+    )
+    # endregion
+
+
+# region agent log
+_append_debug_mode_log(
+    "H1",
+    "search_r1/search/retrieval_server.py:56",
+    "Pre-import runtime context for search_r1 package resolution.",
+    {
+        "cwd": os.getcwd(),
+        "script_file": __file__,
+        "package": __package__,
+        "project_root_guess": PROJECT_ROOT_FOR_IMPORT,
+        "search_package_dir_exists": os.path.isdir(os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))),
+        "sys_path_head": sys.path[:5],
+    },
+)
+# endregion
 import torch
 import faiss
 import numpy as np
 from transformers import AutoConfig, AutoTokenizer, AutoModel
 from tqdm import tqdm
 import datasets
+try:
+    # region agent log
+    _append_debug_mode_log(
+        "H2",
+        "search_r1/search/retrieval_server.py:77",
+        "Attempting to import search_r1.search.corpus_loader.",
+        {
+            "cwd": os.getcwd(),
+            "package": __package__,
+            "sys_path_head": sys.path[:5],
+        },
+    )
+    # endregion
+    from search_r1.search.corpus_loader import load_corpus, resolve_arrow_dir
+except Exception as exc:
+    # region agent log
+    _append_debug_mode_log(
+        "H3",
+        "search_r1/search/retrieval_server.py:88",
+        "Failed to import search_r1.search.corpus_loader.",
+        {
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "cwd": os.getcwd(),
+            "package": __package__,
+            "sys_path_head": sys.path[:5],
+        },
+    )
+    # endregion
+    raise
 
 import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-def load_corpus(corpus_path: str):
-    corpus = datasets.load_dataset(
-        'json', 
-        data_files=corpus_path,
-        split="train",
-        num_proc=4,
-        cache_dir=os.environ["HF_DATASETS_CACHE"],
-    )
-    return corpus
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+DEBUG_DIR = os.path.join(PROJECT_ROOT, "debug")
+DEBUG_LOG_PATH = os.path.join(DEBUG_DIR, "retrieval_server.log")
+
+
+class TeeStream:
+    def __init__(self, original_stream, log_file):
+        self.original_stream = original_stream
+        self.log_file = log_file
+        self.encoding = getattr(original_stream, "encoding", "utf-8")
+
+    def write(self, data):
+        self.original_stream.write(data)
+        self.original_stream.flush()
+        self.log_file.write(data)
+        self.log_file.flush()
+
+    def flush(self):
+        self.original_stream.flush()
+        self.log_file.flush()
+
+    def isatty(self):
+        return self.original_stream.isatty()
+
+    def fileno(self):
+        return self.original_stream.fileno()
+
+    def writable(self):
+        return self.original_stream.writable()
+
+    def __getattr__(self, name):
+        return getattr(self.original_stream, name)
+
+
+def setup_debug_logging():
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    log_file = open(DEBUG_LOG_PATH, "w", buffering=1)
+
+    sys.stdout = TeeStream(sys.__stdout__, log_file)
+    sys.stderr = TeeStream(sys.__stderr__, log_file)
+
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    file_handler = logging.FileHandler(DEBUG_LOG_PATH, mode="a")
+    stream_handler = logging.StreamHandler(sys.__stdout__)
+    for handler in (file_handler, stream_handler):
+        handler.setFormatter(formatter)
+
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(stream_handler)
+
+    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access", "fastapi"):
+        logger = logging.getLogger(logger_name)
+        logger.handlers.clear()
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        logger.addHandler(file_handler)
+        logger.addHandler(stream_handler)
+
+    def handle_uncaught_exception(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        logging.getLogger("retrieval_server").exception(
+            "Unhandled exception during retrieval server startup/runtime.",
+            exc_info=(exc_type, exc_value, exc_traceback),
+        )
+
+    sys.excepthook = handle_uncaught_exception
+    return logging.getLogger("retrieval_server")
 
 def read_jsonl(file_path):
     data = []
@@ -44,12 +202,12 @@ def load_docs(corpus, doc_idxs):
     results = [corpus[int(idx)] for idx in doc_idxs]
     return results
 
-def load_model(model_path: str, use_fp16: bool = False):
+def load_model(model_path: str, use_fp16: bool = False, device: str = "cuda"):
     model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
     model.eval()
-    model.cuda()
-    if use_fp16: 
+    model.to(device)
+    if use_fp16 and device == "cuda":
         model = model.half()
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, trust_remote_code=True)
     return model, tokenizer
@@ -77,8 +235,13 @@ class Encoder:
         self.pooling_method = pooling_method
         self.max_length = max_length
         self.use_fp16 = use_fp16
+        requested_device = os.environ.get("SEARCH_R1_RETRIEVAL_DEVICE", "cpu")
+        if requested_device == "cuda" and not torch.cuda.is_available():
+            warnings.warn("CUDA is unavailable, falling back to CPU for retrieval encoder.")
+            requested_device = "cpu"
+        self.device = requested_device
 
-        self.model, self.tokenizer = load_model(model_path=model_path, use_fp16=use_fp16)
+        self.model, self.tokenizer = load_model(model_path=model_path, use_fp16=use_fp16, device=self.device)
         self.model.eval()
 
     @torch.no_grad()
@@ -103,7 +266,7 @@ class Encoder:
                                 truncation=True,
                                 return_tensors="pt"
                                 )
-        inputs = {k: v.cuda() for k, v in inputs.items()}
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         if "T5" in type(self.model).__name__:
             # T5-based retrieval model
@@ -127,7 +290,8 @@ class Encoder:
         query_emb = query_emb.astype(np.float32, order="C")
         
         del inputs, output
-        torch.cuda.empty_cache()
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
 
         return query_emb
 
@@ -139,6 +303,15 @@ class BaseRetriever:
         
         self.index_path = config.index_path
         self.corpus_path = config.corpus_path
+        self.arrow_corpus_dir = getattr(config, "arrow_corpus_dir", None)
+
+    def _load_corpus(self):
+        return load_corpus(
+            corpus_path=self.corpus_path,
+            arrow_dir=self.arrow_corpus_dir,
+            cache_dir=os.environ["HF_DATASETS_CACHE"],
+            allow_json_fallback=False,
+        )
 
     def _search(self, query: str, num: int, return_score: bool):
         raise NotImplementedError
@@ -159,7 +332,7 @@ class BM25Retriever(BaseRetriever):
         self.searcher = LuceneSearcher(self.index_path)
         self.contain_doc = self._check_contain_doc()
         if not self.contain_doc:
-            self.corpus = load_corpus(self.corpus_path)
+            self.corpus = self._load_corpus()
         self.max_process_num = 8
     
     def _check_contain_doc(self):
@@ -223,7 +396,7 @@ class DenseRetriever(BaseRetriever):
             co.shard = True
             self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
 
-        self.corpus = load_corpus(self.corpus_path)
+        self.corpus = self._load_corpus()
         self.encoder = Encoder(
             model_name = self.retrieval_method,
             model_path = config.retrieval_model_path,
@@ -301,6 +474,7 @@ class Config:
         retrieval_topk: int = 10,
         index_path: str = "./index/bm25",
         corpus_path: str = "./data/corpus.jsonl",
+        arrow_corpus_dir: Optional[str] = None,
         dataset_path: str = "./data",
         data_split: str = "train",
         faiss_gpu: bool = True,
@@ -314,6 +488,7 @@ class Config:
         self.retrieval_topk = retrieval_topk
         self.index_path = index_path
         self.corpus_path = corpus_path
+        self.arrow_corpus_dir = arrow_corpus_dir
         self.dataset_path = dataset_path
         self.data_split = data_split
         self.faiss_gpu = faiss_gpu
@@ -331,6 +506,8 @@ class QueryRequest(BaseModel):
 
 
 app = FastAPI()
+config = None
+retriever = None
 
 @app.post("/retrieve")
 def retrieve_endpoint(request: QueryRequest):
@@ -368,37 +545,67 @@ def retrieve_endpoint(request: QueryRequest):
 
 
 if __name__ == "__main__":
+    logger = setup_debug_logging()
+    logger.info("Writing retrieval server logs to %s", DEBUG_LOG_PATH)
     
     parser = argparse.ArgumentParser(description="Launch the local faiss retriever.")
     parser.add_argument("--index_path", type=str, default="/root/autodl-tmp/retrieval_materials/e5_HNSW64.index", help="Corpus indexing file.")
     parser.add_argument("--corpus_path", type=str, default="/root/autodl-tmp/retrieval_materials/wiki-18.jsonl", help="Local corpus file.")
+    parser.add_argument("--arrow_corpus_dir", type=str, default=os.environ.get("SEARCH_R1_ARROW_CORPUS_DIR"), help="Directory containing cached Arrow shards. If omitted, the server will try to locate a matching Arrow cache automatically.")
     parser.add_argument("--topk", type=int, default=3, help="Number of retrieved passages for one query.")
     parser.add_argument("--retriever_name", type=str, default="e5", help="Name of the retriever model.")
     parser.add_argument("--retriever_model", type=str, default="/root/autodl-tmp/e5-base-v2", help="Path of the retriever model.")
-    parser.add_argument('--faiss_gpu', action='store_true', help='Use GPU for computation')
+    parser.add_argument('--faiss_gpu', action='store_true', help='Use GPU for FAISS computation')
+    parser.add_argument('--device', type=str, default='cuda', choices=['cpu', 'cuda'], help='Device for the retrieval encoder model.')
+    parser.add_argument('--retrieval_batch_size', type=int, default=64, help='Batch size for dense retrieval encoding.')
+    parser.add_argument('--retrieval_use_fp16', action='store_true', help='Use fp16 for the retrieval encoder when running on CUDA.')
 
     args = parser.parse_args()
-    
-    # 1) Build a config (could also parse from arguments).
-    #    In real usage, you'd parse your CLI arguments or environment variables.
-    print("Initializing configuration...")
-    config = Config(
-        retrieval_method = args.retriever_name,  # or "dense"
-        index_path=args.index_path,
+    args.arrow_corpus_dir = resolve_arrow_dir(
         corpus_path=args.corpus_path,
-        retrieval_topk=args.topk,
-        faiss_gpu=args.faiss_gpu,
-        retrieval_model_path=args.retriever_model,
-        retrieval_pooling_method="mean",
-        retrieval_query_max_length=256,
-        retrieval_use_fp16=True,
-        retrieval_batch_size=512,
+        arrow_dir=args.arrow_corpus_dir,
+        cache_dir=os.environ["HF_DATASETS_CACHE"],
     )
-
-    # 2) Instantiate a global retriever so it is loaded once and reused.
-    print(f"Loading FAISS index, corpus, and model ({args.retriever_model}). This may take a while...")
-    retriever = get_retriever(config)
     
-    # 3) Launch the server. By default, it listens on http://127.0.0.1:8000
-    print("Retriever loaded successfully! Starting Uvicorn server on http://0.0.0.0:8000 ...")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    try:
+        # 1) Build a config (could also parse from arguments).
+        logger.info("Initializing configuration...")
+        logger.info(
+            "Startup args: index_path=%s, corpus_path=%s, retriever=%s, model=%s, faiss_gpu=%s",
+            args.index_path,
+            args.corpus_path,
+            args.retriever_name,
+            args.retriever_model,
+            args.faiss_gpu,
+        )
+        if args.arrow_corpus_dir:
+            logger.info("Resolved Arrow corpus dir: %s", args.arrow_corpus_dir)
+        else:
+            logger.error("No Arrow corpus dir resolved. Retrieval will fail until you provide a valid Arrow cache.")
+        config = Config(
+            retrieval_method = args.retriever_name,  # or "dense"
+            index_path=args.index_path,
+            corpus_path=args.corpus_path,
+            arrow_corpus_dir=args.arrow_corpus_dir,
+            retrieval_topk=args.topk,
+            faiss_gpu=args.faiss_gpu,
+            retrieval_model_path=args.retriever_model,
+            retrieval_pooling_method="mean",
+            retrieval_query_max_length=256,
+            retrieval_use_fp16=args.retrieval_use_fp16,
+            retrieval_batch_size=args.retrieval_batch_size,
+        )
+        if args.device not in ("cpu", "cuda"):
+            raise ValueError(f"Unsupported retrieval device: {args.device}")
+        os.environ["SEARCH_R1_RETRIEVAL_DEVICE"] = args.device
+
+        # 2) Instantiate a global retriever so it is loaded once and reused.
+        logger.info("Loading FAISS index, corpus, and model. This may take a while...")
+        retriever = get_retriever(config)
+        
+        # 3) Launch the server. By default, it listens on http://127.0.0.1:8000
+        logger.info("Retriever loaded successfully. Starting Uvicorn server on http://0.0.0.0:8000 ...")
+        uvicorn.run(app, host="0.0.0.0", port=8000, log_config=None, access_log=True)
+    except Exception:
+        logger.exception("Failed to start retrieval server.")
+        raise

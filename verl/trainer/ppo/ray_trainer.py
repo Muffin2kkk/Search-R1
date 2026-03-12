@@ -29,6 +29,7 @@ import json
 from collections import defaultdict
 
 import numpy as np
+import torch
 from codetiming import Timer
 from omegaconf import OmegaConf, open_dict
 from verl import DataProto
@@ -332,17 +333,21 @@ class RayPPOTrainer(object):
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
+        self.inference_only = bool(config.trainer.get('inference_only', False))
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, 'Currently, only support hybrid engine'
 
         if self.hybrid_engine:
-            assert Role.ActorRollout in role_worker_mapping, f'{role_worker_mapping.keys()=}'
+            rollout_role = Role.Rollout if self.inference_only else Role.ActorRollout
+            assert rollout_role in role_worker_mapping, f'{role_worker_mapping.keys()=}'
 
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
-        self.use_reference_policy = Role.RefPolicy in role_worker_mapping
-        self.use_rm = Role.RewardModel in role_worker_mapping
+        self.rollout_role = Role.Rollout if self.inference_only else Role.ActorRollout
+        self.rollout_worker_key = 'rollout' if self.inference_only else 'actor_rollout'
+        self.use_reference_policy = Role.RefPolicy in role_worker_mapping and not self.inference_only
+        self.use_rm = Role.RewardModel in role_worker_mapping and not self.inference_only
         self.ray_worker_group_cls = ray_worker_group_cls
 
         # define KL control
@@ -373,6 +378,8 @@ class RayPPOTrainer(object):
         from torch.utils.data import DataLoader
         # TODO: we have to make sure the batch size is divisible by the dp size
         from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
+        inference_batch_size = self.config.data.get('inference_batch_size', None)
+
         self.train_dataset = RLHFDataset(parquet_files=self.config.data.train_files,
                                          tokenizer=self.tokenizer,
                                          prompt_key=self.config.data.prompt_key,
@@ -393,6 +400,14 @@ class RayPPOTrainer(object):
                                            drop_last=True,
                                            collate_fn=collate_fn)
 
+        self.train_infer_dataloader = DataLoader(
+            dataset=self.train_dataset,
+            batch_size=inference_batch_size or self.config.data.train_batch_size,
+            shuffle=False,
+            drop_last=False,
+            collate_fn=collate_fn,
+        )
+
         self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
                                        tokenizer=self.tokenizer,
                                        prompt_key=self.config.data.prompt_key,
@@ -408,15 +423,17 @@ class RayPPOTrainer(object):
         print(f"filtered validation dataset size: {len(self.val_dataset.dataframe)}")
 
         self.val_dataloader = DataLoader(dataset=self.val_dataset,
-                                         batch_size=self.config.data.val_batch_size,
+                                         batch_size=inference_batch_size or self.config.data.val_batch_size,
                                          shuffle=False,
-                                         drop_last=True,
+                                         drop_last=False,
                                          collate_fn=collate_fn)
 
         print(f'Size of train dataloader: {len(self.train_dataloader)}')
+        print(f'Size of train inference dataloader: {len(self.train_infer_dataloader)}')
         print(f'Size of val dataloader: {len(self.val_dataloader)}')
         
-        assert len(self.train_dataloader) >= 1
+        if not self.inference_only:
+            assert len(self.train_dataloader) >= 1
         assert len(self.val_dataloader) >= 1
 
         # inject total_training_steps to actor/critic optim_config. This is hacky.
@@ -433,14 +450,139 @@ class RayPPOTrainer(object):
             self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
             self.config.critic.optim.total_training_steps = total_training_steps
 
-    def _validate(self):
+    def _reset_rollout_log(self, reward_fn):
+        log_file = getattr(reward_fn, 'log_file', None)
+        if log_file is None:
+            return
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        if self._should_resume_inference() and os.path.exists(log_file):
+            print(f'Preserving existing rollout log for resume: {log_file}')
+            return
+        if os.path.exists(log_file):
+            os.remove(log_file)
+
+    def _should_resume_inference(self):
+        return self.inference_only and bool(self.config.trainer.get('resume_inference', False))
+
+    @staticmethod
+    def _normalize_sample_identifier(value):
+        if hasattr(value, 'item'):
+            value = value.item()
+        if value is None:
+            return None
+        if isinstance(value, float) and np.isnan(value):
+            return None
+        value = str(value).strip()
+        if value == '' or value.lower() in {'none', 'nan'}:
+            return None
+        return value
+
+    @classmethod
+    def _make_sample_key(cls, uid=None, index=None):
+        normalized_uid = cls._normalize_sample_identifier(uid)
+        if normalized_uid is not None:
+            return f'uid:{normalized_uid}'
+        normalized_index = cls._normalize_sample_identifier(index)
+        if normalized_index is not None:
+            return f'index:{normalized_index}'
+        return None
+
+    def _load_completed_sample_keys(self, log_file):
+        completed_keys = set()
+        if not self._should_resume_inference() or log_file is None or not os.path.exists(log_file):
+            return completed_keys
+
+        with open(log_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                sample_key = record.get('sample_key')
+                if sample_key is None:
+                    sample_key = self._make_sample_key(uid=record.get('uid'), index=record.get('index'))
+                if sample_key is not None:
+                    completed_keys.add(sample_key)
+
+        print(f'Loaded {len(completed_keys)} completed samples from {log_file}')
+        return completed_keys
+
+    def _filter_batch_dict_for_pending_samples(self, batch_dict, completed_keys):
+        batch_size = int(batch_dict['input_ids'].shape[0])
+        uids = batch_dict.get('uid')
+        indices = batch_dict.get('index')
+        sample_keys = []
+        keep_indices = []
+
+        for row_idx in range(batch_size):
+            uid = uids[row_idx] if uids is not None else None
+            index = indices[row_idx] if indices is not None else None
+            sample_key = self._make_sample_key(uid=uid, index=index)
+            sample_keys.append(sample_key)
+            if sample_key is None or sample_key not in completed_keys:
+                keep_indices.append(row_idx)
+
+        skipped_count = batch_size - len(keep_indices)
+        pending_sample_keys = [sample_keys[row_idx] for row_idx in keep_indices if sample_keys[row_idx] is not None]
+        if skipped_count == 0:
+            return batch_dict, skipped_count, pending_sample_keys
+        if len(keep_indices) == 0:
+            return None, skipped_count, []
+
+        filtered_batch_dict = {}
+        for key, value in batch_dict.items():
+            if isinstance(value, torch.Tensor):
+                filtered_batch_dict[key] = value[keep_indices]
+            elif isinstance(value, np.ndarray):
+                filtered_batch_dict[key] = value[keep_indices]
+            elif isinstance(value, list):
+                filtered_batch_dict[key] = [value[i] for i in keep_indices]
+            else:
+                filtered_batch_dict[key] = value
+
+        return filtered_batch_dict, skipped_count, pending_sample_keys
+
+    def _aggregate_logged_metrics(self, log_file, split_name: str, metric_prefix: str):
+        if log_file is None or not os.path.exists(log_file):
+            return {}
+
+        data_source_reward = defaultdict(list)
+        with open(log_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get('split') != split_name:
+                    continue
+                data_source = record.get('data_source', 'unknown')
+                score = record.get('score')
+                if score is None:
+                    continue
+                data_source_reward[data_source].append(float(score))
+
+        metric_dict = {}
+        for data_source, rewards in data_source_reward.items():
+            metric_dict[f'{metric_prefix}/{data_source}'] = np.mean(rewards)
+        return metric_dict
+
+    def _run_rollout_on_dataloader(self, dataloader, reward_fn, split_name: str, metric_prefix: str):
         """
-        The training loop of PPO with global metric computation.
-        Accumulates metrics across all batches before computing final statistics.
+        Run generation on a full split and accumulate metrics across all batches.
         """
-        import torch
         reward_tensor_lst = []
         data_source_lst = []
+        self._reset_rollout_log(reward_fn)
+        log_file = getattr(reward_fn, 'log_file', None)
+        completed_keys = self._load_completed_sample_keys(log_file)
+        skipped_completed_samples = 0
+        print(f'Start rollout for split={split_name}, num_batches={len(dataloader)}')
 
         gen_config = GenerationConfig(
             max_turns=self.config.max_turns,
@@ -463,7 +605,14 @@ class RayPPOTrainer(object):
         )
 
         if not self.config.do_search:
-            for test_data in self.val_dataloader:
+            for test_data in dataloader:
+                pending_sample_keys = []
+                if completed_keys:
+                    test_data, skipped_in_batch, pending_sample_keys = self._filter_batch_dict_for_pending_samples(
+                        test_data, completed_keys)
+                    skipped_completed_samples += skipped_in_batch
+                    if test_data is None:
+                        continue
                 test_batch = DataProto.from_single_dict(test_data)
 
                 # we only do validation on rule-based rm
@@ -490,12 +639,20 @@ class RayPPOTrainer(object):
 
                 # evaluate using reward_function
                 # for certain reward function (e.g. sandbox), the generation can overlap with reward
-                reward_tensor = self.val_reward_fn(test_batch)
+                reward_tensor = reward_fn(test_batch)
 
                 reward_tensor_lst.append(reward_tensor)
                 data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+                completed_keys.update(pending_sample_keys)
         else:
-            for batch_dict in self.val_dataloader:
+            for batch_dict in dataloader:
+                pending_sample_keys = []
+                if completed_keys:
+                    batch_dict, skipped_in_batch, pending_sample_keys = self._filter_batch_dict_for_pending_samples(
+                        batch_dict, completed_keys)
+                    skipped_completed_samples += skipped_in_batch
+                    if batch_dict is None:
+                        continue
                 timing_raw = {}
                 test_batch: DataProto = DataProto.from_single_dict(batch_dict)
                 # test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n_agent, interleave=True)
@@ -524,10 +681,23 @@ class RayPPOTrainer(object):
                     
                     # evaluate using reward_function
                     # for certain reward function (e.g. sandbox), the generation can overlap with reward
-                    reward_tensor = self.val_reward_fn(test_batch)
+                    reward_tensor = reward_fn(test_batch)
 
                     reward_tensor_lst.append(reward_tensor)
                     data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+                    completed_keys.update(pending_sample_keys)
+
+        if skipped_completed_samples > 0:
+            print(f'Resume skipped {skipped_completed_samples} completed samples for split={split_name}')
+
+        if self._should_resume_inference():
+            aggregated_metrics = self._aggregate_logged_metrics(log_file=log_file,
+                                                               split_name=split_name,
+                                                               metric_prefix=metric_prefix)
+            if aggregated_metrics:
+                return aggregated_metrics
+            if len(reward_tensor_lst) == 0:
+                return {}
 
         reward_tensor = torch.cat([rw.sum(-1) for rw in reward_tensor_lst], dim=0).cpu()  # (batch_size,)
         # reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
@@ -542,8 +712,46 @@ class RayPPOTrainer(object):
 
         metric_dict = {}
         for data_source, rewards in data_source_reward.items():
-            metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+            metric_dict[f'{metric_prefix}/{data_source}'] = np.mean(rewards)
 
+        return metric_dict
+
+    def _validate(self):
+        return self._run_rollout_on_dataloader(
+            dataloader=self.val_dataloader,
+            reward_fn=self.val_reward_fn,
+            split_name='val',
+            metric_prefix='val/test_score',
+        )
+
+    def run_inference(self):
+        split_alias = {
+            'val': 'test',
+            'validation': 'test',
+            'test': 'test',
+            'train': 'train',
+        }
+        requested_splits = self.config.trainer.get('inference_splits', ['train', 'test'])
+        metric_dict = {}
+        for raw_split in requested_splits:
+            split = split_alias.get(str(raw_split), str(raw_split))
+            if split == 'train':
+                split_metrics = self._run_rollout_on_dataloader(
+                    dataloader=self.train_infer_dataloader,
+                    reward_fn=self.reward_fn,
+                    split_name='train',
+                    metric_prefix='inference/train_score',
+                )
+            elif split == 'test':
+                split_metrics = self._run_rollout_on_dataloader(
+                    dataloader=self.val_dataloader,
+                    reward_fn=self.val_reward_fn,
+                    split_name='test',
+                    metric_prefix='inference/test_score',
+                )
+            else:
+                raise ValueError(f'Unsupported inference split: {raw_split}')
+            metric_dict.update(split_metrics)
         return metric_dict
 
 
@@ -555,16 +763,18 @@ class RayPPOTrainer(object):
 
         # create actor and rollout
         if self.hybrid_engine:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
-            actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.ActorRollout],
+            resource_pool = self.resource_pool_manager.get_resource_pool(self.rollout_role)
+            actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[self.rollout_role],
                                                      config=self.config.actor_rollout_ref,
-                                                     role='actor_rollout')
-            self.resource_pool_to_cls[resource_pool]['actor_rollout'] = actor_rollout_cls
+                                                     role=self.rollout_worker_key)
+            self.resource_pool_to_cls[resource_pool][self.rollout_worker_key] = actor_rollout_cls
         else:
             raise NotImplementedError
 
         # create critic
-        if self.config.algorithm.adv_estimator == 'gae':
+        if self.inference_only:
+            self.use_critic = False
+        elif self.config.algorithm.adv_estimator == 'gae':
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=self.config.critic)
             self.resource_pool_to_cls[resource_pool]['critic'] = critic_cls
@@ -617,7 +827,7 @@ class RayPPOTrainer(object):
             self.rm_wg.init_model()
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
-        self.actor_rollout_wg = all_wg['actor_rollout']
+        self.actor_rollout_wg = all_wg[self.rollout_worker_key]
         self.actor_rollout_wg.init_model()
 
     def _save_checkpoint(self):
@@ -660,6 +870,12 @@ class RayPPOTrainer(object):
 
         logger = self.logger
         self.global_steps = 0
+        if self.inference_only:
+            inference_metrics = self.run_inference()
+            pprint(f'Inference metrics: {inference_metrics}')
+            logger.log(data=inference_metrics, step=self.global_steps)
+            return
+
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
@@ -693,6 +909,11 @@ class RayPPOTrainer(object):
 
         # start training loop
         for epoch in range(self.config.trainer.total_epochs):
+            if hasattr(self.reward_fn, 'log_file') and self.reward_fn.log_file is not None:
+                import os
+                base_dir = os.path.dirname(self.reward_fn.log_file)
+                self.reward_fn.log_file = os.path.join(base_dir, f'epoch_{epoch}_rollouts.jsonl')
+
             for batch_dict in self.train_dataloader:
                 print(f'epoch {epoch}, step {self.global_steps}')
                 metrics = {}

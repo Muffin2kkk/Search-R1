@@ -4,16 +4,56 @@ from pathlib import Path
 from datasets import load_dataset
 
 
-PARALLEL_PROMPT_TEMPLATE = """Answer the given question. \
-You must conduct reasoning inside <think> and </think> first every time you get new information. \
-After reasoning, if you find you lack some knowledge, you can call a search engine by <search> query </search> and it will return the top searched results between <information> and </information>. \
-You should try to resolve the question in as few search turns as possible. \
-If the question can be answered with one focused query, prefer a single <search>. \
-If multiple independent pieces of information need to be looked up simultaneously, you may issue parallel searches in one turn by wrapping them together: <searches> <search> query1 </search> <search> query2 </search> </searches>. \
-Use parallel searches only when the sub-queries are complementary and do not depend on each other's results. \
-Do not issue parallel searches that are merely different rephrasings of the same information need. \
-If the next query depends on the result of the current query, use sequential search instead. \
-If you find no further external knowledge needed, you can directly provide the answer inside <answer> and </answer>, without detailed illustrations. For example, <answer> Beijing </answer>. Question: {question}\n"""
+PARALLEL_PROMPT_TEMPLATE = """Answer the given question.
+
+You must follow this format strictly:
+<decision> brief action-oriented decision </decision>
+<search> query </search>
+
+or
+
+<decision> brief action-oriented decision </decision>
+<searches> <search> query1 </search> <search> query2 </search> </searches>
+
+or
+
+<decision> brief action-oriented decision </decision>
+<answer> final answer </answer>
+
+Rules:
+- Before every action, you must output exactly one <decision> block.
+- The <decision> block must be brief and action-oriented.
+- Use the <decision> block only to state:
+  1) what needs to be verified or concluded, and
+  2) whether to use a single search, parallel searches, or answer directly.
+- Do not include long reasoning, background knowledge, or detailed explanation in <decision>.
+- Keep each <decision> short, usually one sentence and at most two sentences.
+
+Search policy:
+- For questions involving factual world knowledge, named entities, biographies, occupations, dates, places, organizations, events, records, rankings, relationships, or other external facts, verify the needed facts with search before answering, even if you believe you already know the answer.
+- Do not answer factual verification questions directly from memory without first retrieving evidence.
+- If one focused query is sufficient, prefer a single <search>.
+- If multiple independent pieces of information need to be verified simultaneously, you may issue parallel searches in one turn by wrapping them together:
+  <searches> <search> query1 </search> <search> query2 </search> </searches>
+- Use parallel searches only when the sub-queries are complementary and do not depend on each other's results.
+- Do not issue parallel searches that are merely different rephrasings of the same information need.
+- If the next query depends on the result of the current query, use sequential search instead.
+- Try to resolve the question in as few search turns as possible.
+
+Answer policy:
+- Only when the question can be answered without any external factual knowledge, such as pure reasoning or calculation, may you answer directly without search.
+- Once enough evidence has been gathered, provide the final answer inside <answer> and </answer>, without detailed illustrations.
+
+Use the <decision> block to briefly state:
+1) what information needs to be verified or concluded, and
+2) why the next action should be a single search, parallel searches, sequential search, or a direct answer.
+
+Examples of good <decision> blocks:
+<decision> Only one factual attribute needs to be verified, so use a single search. </decision>
+<decision> The same attribute needs to be verified for multiple independent entities, so use parallel searches. </decision>
+<decision> Multiple independent pieces of information need to be verified, so use parallel searches. </decision>
+<decision> The next fact depends on the result of the first search, so use a single search sequentially. </decision>
+<decision> The retrieved evidence is sufficient to answer the question, so answer now. </decision> Question: {question}\n"""
 
 QUESTION_MARKER = "Question: "
 
@@ -25,13 +65,13 @@ def parse_args():
     parser.add_argument(
         "--input_dir",
         type=Path,
-        required=True,
+        default=Path("data/nq_hotpotqa_tiny"),
         help="Directory containing train.parquet and test.parquet.",
     )
     parser.add_argument(
         "--output_dir",
         type=Path,
-        required=True,
+        default=Path("data/nq_hotpotqa_tiny/distillation"),
         help="Directory to save the rewritten dataset.",
     )
     return parser.parse_args()

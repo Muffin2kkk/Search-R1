@@ -179,10 +179,12 @@ class StrongRolloutCollector:
         rows: List[Dict[str, Any]],
         split: str,
         start_idx: int = 0,
+        row_indices: Optional[List[int]] = None,
     ) -> List[Dict[str, Any]]:
+        effective_indices = row_indices or [start_idx + idx for idx, _ in enumerate(rows)]
         states = [
-            self._build_state(row=row, split=split, idx=start_idx + idx)
-            for idx, row in enumerate(rows)
+            self._build_state(row=row, split=split, idx=row_idx)
+            for row, row_idx in zip(rows, effective_indices)
         ]
 
         for _ in range(self.config.max_turns):
@@ -346,6 +348,7 @@ class StrongRolloutCollector:
 
     def _serialize_state(self, state: SampleState) -> Dict[str, Any]:
         row = copy.deepcopy(state.source_row)
+        row["sample_id"] = state.sample_id
         row["messages"] = state.messages
         row["rollout_turns"] = state.rollout_turns
         row["final_answer"] = state.final_answer

@@ -1,15 +1,16 @@
 import argparse
+import json
 import math
 from pathlib import Path
-from typing import Dict, List
+from typing import Any, Dict, List, Set, Tuple
 
 from datasets import Dataset, load_dataset
 
 try:
-    from .strong_model_client import StrongModelClient
+    from .strong_model_client import StrongModelClient, is_likely_balance_error
     from .strong_rollout_collector import CollectorConfig, StrongRolloutCollector, dumps_jsonl_row
 except ImportError:
-    from strong_model_client import StrongModelClient
+    from strong_model_client import StrongModelClient, is_likely_balance_error
     from strong_rollout_collector import CollectorConfig, StrongRolloutCollector, dumps_jsonl_row
 
 
@@ -99,7 +100,7 @@ def parse_args():
         "--llm_api_key",
         type=str,
         default=None,
-        help="API key for the remote LLM. If omitted, read LLM_API_KEY from environment.",
+        help="API key for the remote LLM. If omitted, use the hardcoded default in the client.",
     )
     parser.add_argument(
         "--llm_model",
@@ -122,13 +123,13 @@ def parse_args():
     parser.add_argument(
         "--llm_temperature",
         type=float,
-        default=0.7,
-        help="Sampling temperature.",
+        default=0.3,
+        help="Sampling temperature. Lower values are more stable for distillation.",
     )
     parser.add_argument(
         "--llm_top_p",
         type=float,
-        default=0.95,
+        default=0.8,
         help="Top-p for sampling.",
     )
     parser.add_argument(
@@ -159,7 +160,7 @@ def parse_args():
         "--llm_extra_body",
         type=str,
         default=None,
-        help="Optional JSON string merged into the raw LLM request body.",
+        help="Optional JSON string merged into the raw LLM request body. Thinking mode is disabled in the client.",
     )
     parser.add_argument(
         "--write_parquet",
@@ -187,12 +188,58 @@ def chunk_rows(rows: List[Dict], batch_size: int):
         yield batch_idx, rows[start:end], total_batches
 
 
+def build_sample_id(row: Dict[str, Any], split: str, idx: int) -> str:
+    extra_info = row.get("extra_info", {}) if isinstance(row, dict) else {}
+    source_idx = extra_info.get("index", idx)
+    return f"{split}-{source_idx}"
+
+
+def load_existing_jsonl(path: Path, split: str) -> Tuple[List[Dict[str, Any]], Set[str], int]:
+    if not path.exists():
+        return [], set(), 0
+
+    rows: List[Dict[str, Any]] = []
+    sample_ids: Set[str] = set()
+    skipped_error_rows = 0
+    with path.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                print(f"[warn] Skipping invalid JSONL line {line_no} in {path}")
+                continue
+            if row.get("collector_error"):
+                skipped_error_rows += 1
+                continue
+            rows.append(row)
+            sample_id = row.get("sample_id")
+            if not sample_id:
+                source_idx = row.get("extra_info", {}).get("index") if isinstance(row.get("extra_info"), dict) else None
+                if source_idx is not None:
+                    sample_id = f"{split}-{source_idx}"
+            if sample_id:
+                sample_ids.add(str(sample_id))
+    return rows, sample_ids, skipped_error_rows
+
+
 def write_jsonl(path: Path, rows: List[Dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(dumps_jsonl_row(row))
             f.write("\n")
+
+
+def append_jsonl(path: Path, rows: List[Dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        for row in rows:
+            f.write(dumps_jsonl_row(row))
+            f.write("\n")
+        f.flush()
 
 
 def write_parquet(path: Path, rows: List[Dict]) -> None:
@@ -210,20 +257,59 @@ def process_split(split: str, args, collector: StrongRolloutCollector) -> None:
     rows = load_split_rows(input_path, offset=args.offset, limit=args.limit)
     print(f"[info] {split}: loaded {len(rows)} rows")
 
-    collected_rows: List[Dict] = []
-    for batch_idx, batch_rows, total_batches in chunk_rows(rows, args.batch_size):
-        batch_start = batch_idx * args.batch_size + args.offset
+    output_jsonl = args.output_dir / f"{split}.jsonl"
+    collected_rows, completed_sample_ids, skipped_error_rows = load_existing_jsonl(output_jsonl, split=split)
+    if skipped_error_rows:
+        write_jsonl(output_jsonl, collected_rows)
+        print(f"[resume] removed {skipped_error_rows} errored rows from {output_jsonl} before retrying")
+    if completed_sample_ids:
+        print(f"[resume] found {len(completed_sample_ids)} completed rows in {output_jsonl}")
+    else:
+        write_jsonl(output_jsonl, [])
+
+    pending_items: List[Tuple[int, Dict[str, Any]]] = []
+    for row_offset, row in enumerate(rows):
+        row_idx = args.offset + row_offset
+        sample_id = build_sample_id(row, split, row_idx)
+        if sample_id in completed_sample_ids:
+            continue
+        pending_items.append((row_idx, row))
+
+    if not pending_items:
+        print(f"[resume] {split}: nothing left to process")
+        if args.write_parquet:
+            output_parquet = args.output_dir / f"{split}.parquet"
+            write_parquet(output_parquet, collected_rows)
+            print(f"[save] wrote {output_parquet}")
+        return
+
+    print(f"[resume] {split}: processing {len(pending_items)} remaining rows")
+    for batch_idx, batch_items, total_batches in chunk_rows(pending_items, args.batch_size):
+        row_indices = [row_idx for row_idx, _ in batch_items]
+        batch_rows = [row for _, row in batch_items]
         print(
             f"[collect] split={split} batch={batch_idx + 1}/{total_batches} "
             f"size={len(batch_rows)}"
         )
-        collected_rows.extend(
-            collector.collect_batch(batch_rows, split=split, start_idx=batch_start)
+        batch_results = collector.collect_batch(
+            batch_rows,
+            split=split,
+            start_idx=row_indices[0],
+            row_indices=row_indices,
         )
+        collected_rows.extend(batch_results)
+        append_jsonl(output_jsonl, batch_results)
+        print(f"[save] appended {len(batch_results)} rows to {output_jsonl}")
 
-    output_jsonl = args.output_dir / f"{split}.jsonl"
-    write_jsonl(output_jsonl, collected_rows)
-    print(f"[save] wrote {output_jsonl}")
+        balance_errors = [
+            row.get("collector_error")
+            for row in batch_results
+            if is_likely_balance_error(row.get("collector_error"))
+        ]
+        if balance_errors:
+            print("[error] Detected possible LLM balance/quota issue. Saved completed rows before stopping.")
+            print(f"[error] Example upstream error: {balance_errors[0]}")
+            return
 
     if args.write_parquet:
         output_parquet = args.output_dir / f"{split}.parquet"

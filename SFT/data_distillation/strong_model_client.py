@@ -7,6 +7,9 @@ from typing import Any, Dict, List, Optional
 import requests
 
 
+HARDCODED_DASHSCOPE_API_KEY = "sk-4f0c4cc8a9c446bf82095ee86ec0af4b"
+
+
 @dataclass
 class StrongModelConfig:
     model: str
@@ -14,8 +17,8 @@ class StrongModelConfig:
     api_key: Optional[str] = None
     api_path: str = "/chat/completions"
     timeout: int = 120
-    temperature: float = 0.7
-    top_p: float = 0.95
+    temperature: float = 0.3
+    top_p: float = 0.8
     max_tokens: int = 512
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
@@ -54,11 +57,13 @@ class StrongModelClient:
         extra_body: Dict[str, Any] = {}
         if getattr(args, "llm_extra_body", None):
             extra_body = json.loads(args.llm_extra_body)
+        # Force-disable thinking mode for distillation runs.
+        extra_body["enable_thinking"] = False
 
         config = StrongModelConfig(
             model=args.llm_model,
             api_base=args.llm_api_base.rstrip("/"),
-            api_key=getattr(args, "llm_api_key", None) or os.environ.get("LLM_API_KEY"),
+            api_key=getattr(args, "llm_api_key", None) or HARDCODED_DASHSCOPE_API_KEY,
             api_path=args.llm_api_path,
             timeout=args.llm_timeout,
             temperature=args.llm_temperature,
@@ -79,6 +84,19 @@ class StrongModelClient:
 
     def _url(self) -> str:
         return f"{self.config.api_base}{self.config.api_path}"
+
+    def _format_error(self, exc: Exception) -> str:
+        if isinstance(exc, requests.HTTPError) and exc.response is not None:
+            response = exc.response
+            detail = response.text.strip()
+            try:
+                detail = json.dumps(response.json(), ensure_ascii=False)
+            except ValueError:
+                pass
+            if detail:
+                return f"HTTPError {response.status_code}: {detail}"
+            return f"HTTPError {response.status_code}: {exc}"
+        return f"{type(exc).__name__}: {exc}"
 
     def generate(self, request: GenerationRequest) -> GenerationResult:
         payload: Dict[str, Any] = {
@@ -123,7 +141,7 @@ class StrongModelClient:
                 finish_reason=None,
                 usage=None,
                 raw_response={},
-                error=f"{type(exc).__name__}: {exc}",
+                error=self._format_error(exc),
             )
 
     def generate_batch(
@@ -138,3 +156,23 @@ class StrongModelClient:
         with ThreadPoolExecutor(max_workers=worker_num) as executor:
             results = list(executor.map(self.generate, requests_list))
         return results
+
+
+def is_likely_balance_error(error_message: Optional[str]) -> bool:
+    if not error_message:
+        return False
+
+    normalized_error = error_message.lower()
+    keywords = [
+        "insufficient",
+        "balance",
+        "arrear",
+        "quota",
+        "payment",
+        "bill",
+        "余额",
+        "欠费",
+        "充值",
+        "账户余额",
+    ]
+    return any(keyword in normalized_error for keyword in keywords)

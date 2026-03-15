@@ -6,9 +6,9 @@ ROOT_DIR="/root/Search-R1"
 SCRIPT_DIR="${ROOT_DIR}/SFT/data_distillation"
 
 # Input / output
-INPUT_DIR="${ROOT_DIR}/data/nq_hotpotqa_train"
-OUTPUT_DIR="${ROOT_DIR}/data/nq_hotpotqa_train/strong_rollouts_qwen"
-SPLITS="train,test"
+INPUT_DIR="${ROOT_DIR}/data/nq_hotpotqa_tiny/distillation"
+OUTPUT_DIR="${ROOT_DIR}/data/nq_hotpotqa_tiny/distillation"
+SPLITS="train"
 
 # Retrieval
 SEARCH_URL="http://127.0.0.1:8000/retrieve"
@@ -21,22 +21,22 @@ BATCH_SIZE=16
 MAX_TURNS=2
 LIMIT=""
 OFFSET=0
-WRITE_PARQUET="true"
+WRITE_PARQUET="false"
 
 # LLM
-LLM_API_BASE="https://your-qwen-endpoint/v1"
+LLM_API_BASE="https://dashscope.aliyuncs.com/compatible-mode/v1"
 LLM_API_PATH="/chat/completions"
-LLM_MODEL="your-qwen-model-name"
-LLM_API_KEY="${LLM_API_KEY:-YOUR_KEY}"
+LLM_MODEL="qwen3.5-plus"
+LLM_API_KEY="sk-4f0c4cc8a9c446bf82095ee86ec0af4b"
 LLM_TIMEOUT=120
 LLM_CONCURRENCY=8
-LLM_TEMPERATURE=0.7
-LLM_TOP_P=0.95
+LLM_TEMPERATURE=0.3
+LLM_TOP_P=0.8
 LLM_MAX_TOKENS=512
 LLM_PRESENCE_PENALTY=0.0
 LLM_FREQUENCY_PENALTY=0.0
 LLM_SEED=""
-LLM_EXTRA_BODY=""
+LLM_EXTRA_BODY='{"enable_thinking": false}'
 
 CMD=(
   python "${SCRIPT_DIR}/collect_strong_rollouts.py"

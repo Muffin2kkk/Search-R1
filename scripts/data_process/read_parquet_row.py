@@ -12,13 +12,13 @@ def parse_args():
     parser.add_argument(
         "--file",
         type=Path,
-        default=Path("data/nq_hotpotqa_tiny/distillation/test.parquet"),
+        default=Path("data/nq_hotpotqa_tiny/parallel_simple/train.parquet"),
         help="Path to the parquet file.",
     )
     parser.add_argument(
         "--row",
         type=int,
-        default=123,
+        default=34,
         help="0-based row index to read.",
     )
     return parser.parse_args()

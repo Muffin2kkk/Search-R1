@@ -2,13 +2,17 @@ import torch
 import re
 from collections import defaultdict
 import os
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass
 from .tensor_helper import TensorHelper, TensorConfig
 from verl import DataProto
 from verl.utils.tracking import Tracking
 import shutil
 import requests
+
+SEARCHES_RE = re.compile(r'<searches>(.*?)</searches>', re.DOTALL)
+SEARCH_RE = re.compile(r'<search>(.*?)</search>', re.DOTALL)
+ANSWER_RE = re.compile(r'<answer>(.*?)</answer>', re.DOTALL)
 
 @dataclass
 class GenerationConfig:
@@ -51,19 +55,18 @@ class LLMGenerationManager:
             padding="longest"
         )['input_ids']
 
-    def _postprocess_responses(self, responses: torch.Tensor) -> torch.Tensor:
+    def _postprocess_responses(self, responses: torch.Tensor) -> Tuple[torch.Tensor, List[str]]:
         """Process responses to stop at search operation or answer operation."""
         responses_str = self.tokenizer.batch_decode(
             responses, 
             skip_special_tokens=True
         )
 
-        responses_str = [resp.split('</search>')[0] + '</search>'
-                 if '</search>' in resp 
-                 else resp.split('</answer>')[0] + '</answer>'
-                 if '</answer>' in resp 
-                 else resp
-                 for resp in responses_str]
+        processed_responses = []
+        for resp in responses_str:
+            action_block = self._extract_first_action_block(resp)
+            processed_responses.append(action_block if action_block is not None else resp)
+        responses_str = processed_responses
 
         if self.config.no_think_rl:
             raise ValueError('stop')
@@ -74,19 +77,32 @@ class LLMGenerationManager:
         responses = self._batch_tokenize(responses_str)
         return responses, responses_str
 
-    def _process_next_obs(self, next_obs: List[str]) -> torch.Tensor:
+    def _process_next_obs(self, next_obs: List[str], obs_token_budgets: List[Optional[int]] = None) -> torch.Tensor:
         """Process next observations from environment."""
-        
+
+        if obs_token_budgets is None:
+            obs_token_budgets = [self.config.max_obs_length] * len(next_obs)
+
+        processed_obs = []
+        for obs, obs_token_budget in zip(next_obs, obs_token_budgets):
+            obs_ids = self.tokenizer(
+                obs,
+                return_tensors='pt',
+                add_special_tokens=False,
+            )['input_ids'][0]
+
+            if obs_token_budget is not None and obs_ids.shape[0] > obs_token_budget:
+                print(f"[WARNING] OBSERVATION TOO LONG, CONSIDER CHANGING YOUR CONFIG, {obs_ids.shape[0]} & {obs_token_budget}")
+                obs_ids = obs_ids[:obs_token_budget]
+
+            processed_obs.append(self.tokenizer.decode(obs_ids, skip_special_tokens=True))
+
         next_obs_ids = self.tokenizer(
-            next_obs, 
+            processed_obs,
             padding='longest',
             return_tensors='pt',
-            add_special_tokens=False,  # Prevents adding special tokens
+            add_special_tokens=False,
         )['input_ids']
-
-        if next_obs_ids.shape[1] > self.config.max_obs_length:
-            print(f"[WARNING] OBSERVATION TOO LONG, CONSIDER CHANGING YOUR CONFIG, {next_obs_ids.shape[1]} & {self.config.max_obs_length}")            
-            next_obs_ids = next_obs_ids[:, :self.config.max_obs_length]
 
         return next_obs_ids
 
@@ -250,7 +266,7 @@ class LLMGenerationManager:
             responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
 
             # Execute in environment and process observations
-            next_obs, dones, valid_action, is_search = self.execute_predictions(
+            next_obs, dones, valid_action, is_search, obs_token_budgets = self.execute_predictions(
                 responses_str, self.tokenizer.pad_token, active_mask
             )
             
@@ -261,7 +277,7 @@ class LLMGenerationManager:
             valid_action_stats += torch.tensor(valid_action, dtype=torch.int)
             valid_search_stats += torch.tensor(is_search, dtype=torch.int)
 
-            next_obs_ids = self._process_next_obs(next_obs)
+            next_obs_ids = self._process_next_obs(next_obs, obs_token_budgets)
             
             # Update states
             rollings = self._update_rolling_state(
@@ -293,7 +309,7 @@ class LLMGenerationManager:
             responses_ids, responses_str = self.tensor_fn._example_level_pad(responses_ids, responses_str, active_mask)
 
             # # Execute in environment and process observations
-            _, dones, valid_action, is_search = self.execute_predictions(
+            _, dones, valid_action, is_search, _ = self.execute_predictions(
                 responses_str, self.tokenizer.pad_token, active_mask, do_search=False
             )
 
@@ -350,7 +366,13 @@ class LLMGenerationManager:
         
         return final_output
 
-    def execute_predictions(self, predictions: List[str], pad_token: str, active_mask=None, do_search=True) -> List[str]:
+    def execute_predictions(
+        self,
+        predictions: List[str],
+        pad_token: str,
+        active_mask=None,
+        do_search=True
+    ) -> Tuple[List[str], List[int], List[int], List[int], List[Optional[int]]]:
         """
         Execute predictions across multiple environments.
         NOTE: the function is the actual `step` function in the environment
@@ -365,14 +387,15 @@ class LLMGenerationManager:
             List of observation strings
         """
         cur_actions, contents = self.postprocess_predictions(predictions)
-        next_obs, dones, valid_action, is_search = [], [], [], []
-        
-        search_queries = [content for action, content in zip(cur_actions, contents) if action == 'search']
-        if do_search:
-            search_results = self.batch_search(search_queries)
-            assert len(search_results) == sum([1 for action in cur_actions if action == 'search'])
+        next_obs, dones, valid_action, is_search, obs_token_budgets = [], [], [], [], []
+
+        search_query_groups = [content for action, content in zip(cur_actions, contents) if action == 'search']
+        flat_search_queries = [query for queries in search_query_groups for query in queries]
+        if do_search and flat_search_queries:
+            search_results = self.batch_search(flat_search_queries)
+            assert len(search_results) == len(flat_search_queries)
         else:
-            search_results = [''] * sum([1 for action in cur_actions if action == 'search'])
+            search_results = [''] * len(flat_search_queries)
 
         for i, (action, active) in enumerate(zip(cur_actions, active_mask)):
             
@@ -381,30 +404,38 @@ class LLMGenerationManager:
                 dones.append(1)
                 valid_action.append(0)
                 is_search.append(0)
+                obs_token_budgets.append(self.config.max_obs_length)
             else:
                 if action == 'answer':
                     next_obs.append('')
                     dones.append(1)
                     valid_action.append(1)
                     is_search.append(0)
+                    obs_token_budgets.append(self.config.max_obs_length)
                 elif action == 'search':
-                    next_obs.append(f'\n\n<information>{search_results.pop(0).strip()}</information>\n\n')
+                    queries = contents[i]
+                    query_results = [search_results.pop(0) for _ in queries]
+                    formatted_observation = self._format_search_observation(queries, query_results)
+                    next_obs.append(f'\n\n<information>{formatted_observation}</information>\n\n')
                     dones.append(0)
                     valid_action.append(1)
                     is_search.append(1)
+                    obs_token_budgets.append(None)
                 else:
                     next_obs.append(f'\nMy previous action is invalid. \
 If I want to search, I should put the query between <search> and </search>. \
+If I want to launch parallel searches, I should put them inside <searches> ... </searches> with one or more <search> blocks. \
 If I want to give the final answer, I should put the answer between <answer> and </answer>. Let me try again.\n')
                     dones.append(0)
                     valid_action.append(0)
                     is_search.append(0)
+                    obs_token_budgets.append(self.config.max_obs_length)
             
         assert len(search_results) == 0
             
-        return next_obs, dones, valid_action, is_search
+        return next_obs, dones, valid_action, is_search, obs_token_budgets
 
-    def postprocess_predictions(self, predictions: List[Any]) -> Tuple[List[int], List[bool]]:
+    def postprocess_predictions(self, predictions: List[Any]) -> Tuple[List[Optional[str]], List[Any]]:
         """
         Process (text-based) predictions from llm into actions and validity flags.
         
@@ -419,14 +450,7 @@ If I want to give the final answer, I should put the answer between <answer> and
                 
         for prediction in predictions:
             if isinstance(prediction, str): # for llm output
-                pattern = r'<(search|answer)>(.*?)</\1>'
-                match = re.search(pattern, prediction, re.DOTALL)
-                if match:
-                    content = match.group(2).strip()  # Return only the content inside the tags
-                    action = match.group(1)
-                else:
-                    content = ''
-                    action = None
+                action, content = self._parse_prediction_action(prediction)
             else:
                 raise ValueError(f"Invalid prediction type: {type(prediction)}")
             
@@ -435,7 +459,7 @@ If I want to give the final answer, I should put the answer between <answer> and
             
         return actions, contents
 
-    def batch_search(self, queries: List[str] = None) -> str:
+    def batch_search(self, queries: List[str] = None) -> List[str]:
         """
         Batchified search for queries.
         Args:
@@ -445,7 +469,7 @@ If I want to give the final answer, I should put the answer between <answer> and
         """
         results = self._batch_search(queries)['result']
         
-        return [self._passages2string(result) for result in results]
+        return [self._truncate_search_result(self._passages2string(result)) for result in results]
 
     def _batch_search(self, queries):
         
@@ -467,3 +491,75 @@ If I want to give the final answer, I should put the answer between <answer> and
             format_reference += f"Doc {idx+1}(Title: {title}) {text}\n"
 
         return format_reference
+
+    def _extract_first_action_block(self, response: str) -> str:
+        candidates = []
+        for action_type, pattern in (
+            ('searches', SEARCHES_RE),
+            ('search', SEARCH_RE),
+            ('answer', ANSWER_RE),
+        ):
+            match = pattern.search(response)
+            if match is not None:
+                candidates.append((match.start(), action_type, match.group(0)))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[0])
+        return candidates[0][2]
+
+    def _parse_prediction_action(self, prediction: str) -> Tuple[str, Any]:
+        candidates = []
+        for action_type, pattern in (
+            ('searches', SEARCHES_RE),
+            ('search', SEARCH_RE),
+            ('answer', ANSWER_RE),
+        ):
+            match = pattern.search(prediction)
+            if match is not None:
+                candidates.append((match.start(), action_type, match))
+
+        if not candidates:
+            return None, ''
+
+        candidates.sort(key=lambda item: item[0])
+        _, action_type, match = candidates[0]
+
+        if action_type == 'searches':
+            queries = [query.strip() for query in SEARCH_RE.findall(match.group(1)) if query.strip()]
+            if not queries:
+                return None, ''
+            return 'search', queries
+
+        if action_type == 'search':
+            query = match.group(1).strip()
+            if not query:
+                return None, ''
+            return 'search', [query]
+
+        answer = match.group(1).strip()
+        return 'answer', answer
+
+    def _truncate_search_result(self, result: str) -> str:
+        result_ids = self.tokenizer(
+            result,
+            return_tensors='pt',
+            add_special_tokens=False,
+        )['input_ids'][0]
+        if result_ids.shape[0] <= self.config.max_obs_length:
+            return result.strip()
+
+        truncated_ids = result_ids[:self.config.max_obs_length]
+        return self.tokenizer.decode(truncated_ids, skip_special_tokens=True).strip()
+
+    def _format_search_observation(self, queries: List[str], query_results: List[str]) -> str:
+        if len(queries) == 1:
+            return query_results[0].strip()
+
+        sections = []
+        for idx, (query, result) in enumerate(zip(queries, query_results), start=1):
+            section = f"[Search {idx}] Query: {query}\n{result.strip()}".strip()
+            sections.append(section)
+
+        return "\n\n".join(sections).strip()

@@ -1,5 +1,5 @@
 export CUDA_VISIBLE_DEVICES=0,1
-export DATA_DIR='data/nq_hotpotqa_train'
+export DATA_DIR='data/nq_hotpotqa_tiny/parallel_simple'
 
 WAND_PROJECT='Search-R1'
 export BASE_MODEL='/root/autodl-tmp/Qwen2.5-3B-Instruct'

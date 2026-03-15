@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 
-HARDCODED_DASHSCOPE_API_KEY = "sk-4f0c4cc8a9c446bf82095ee86ec0af4b"
+HARDCODED_DASHSCOPE_API_KEY = ""
 
 
 @dataclass

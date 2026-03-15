@@ -87,7 +87,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.val_data_num=null \
     data.train_batch_size=64 \
     data.val_batch_size=64 \
-    data.max_prompt_length=4096 \
+    data.max_prompt_length=6144 \
     data.max_response_length=500 \
     data.max_start_length=2048 \
     data.max_obs_length=500 \
@@ -140,7 +140,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.total_training_steps=1005 \
     trainer.default_hdfs_dir=null \
     trainer.default_local_dir=verl_checkpoints/$EXPERIMENT_NAME \
-    max_turns=2 \
+    max_turns=3 \
     retriever.url="http://127.0.0.1:8000/retrieve" \
     retriever.topk=3 \
     2>&1 | tee $EXPERIMENT_NAME.log

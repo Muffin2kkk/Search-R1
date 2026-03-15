@@ -15,10 +15,13 @@ SEARCH_URL="http://127.0.0.1:8000/retrieve"
 RETRIEVER_TOPK=3
 RETRIEVAL_TIMEOUT=60
 RETRIEVAL_CACHE_SIZE=10000
+TOKENIZER_PATH="/root/autodl-tmp/Qwen2.5-3B-Instruct"
+MAX_PROMPT_LENGTH=6144
+MAX_OBS_LENGTH=500
 
 # Rollout
 BATCH_SIZE=16
-MAX_TURNS=2
+MAX_TURNS=3
 LIMIT=""
 OFFSET=0
 WRITE_PARQUET="false"
@@ -27,7 +30,6 @@ WRITE_PARQUET="false"
 LLM_API_BASE="https://dashscope.aliyuncs.com/compatible-mode/v1"
 LLM_API_PATH="/chat/completions"
 LLM_MODEL="qwen3.5-plus"
-LLM_API_KEY="sk-4f0c4cc8a9c446bf82095ee86ec0af4b"
 LLM_TIMEOUT=120
 LLM_CONCURRENCY=8
 LLM_TEMPERATURE=0.3
@@ -49,10 +51,12 @@ CMD=(
   --retriever_topk "${RETRIEVER_TOPK}"
   --retrieval_timeout "${RETRIEVAL_TIMEOUT}"
   --retrieval_cache_size "${RETRIEVAL_CACHE_SIZE}"
+  --tokenizer_path "${TOKENIZER_PATH}"
+  --max_prompt_length "${MAX_PROMPT_LENGTH}"
+  --max_obs_length "${MAX_OBS_LENGTH}"
   --llm_api_base "${LLM_API_BASE}"
   --llm_api_path "${LLM_API_PATH}"
   --llm_model "${LLM_MODEL}"
-  --llm_api_key "${LLM_API_KEY}"
   --llm_timeout "${LLM_TIMEOUT}"
   --llm_concurrency "${LLM_CONCURRENCY}"
   --llm_temperature "${LLM_TEMPERATURE}"

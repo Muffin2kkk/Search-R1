@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import re
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -40,7 +41,7 @@ class TurnResult:
     info_text: str
     prompt_text: str
     char_len: int
-    token_len: int
+    token_len: Optional[int]
 
 
 SCENARIOS = {
@@ -97,6 +98,38 @@ SCENARIOS = {
             ),
         ],
     },
+    "three_round_parallel": {
+        "question": "Were Bruno Soares, Serena Williams, and Roger Federer all professional tennis players, and what evidence supports that?",
+        "actions": [
+            (
+                "<decision>I should verify the occupations of the three people independently, so parallel "
+                "searches are the best first step.</decision>"
+                "<searches>"
+                "<search>Bruno Soares occupation professional tennis player</search>"
+                "<search>Serena Williams occupation professional tennis player</search>"
+                "<search>Roger Federer occupation professional tennis player</search>"
+                "</searches>"
+            ),
+            (
+                "<decision>I should gather supporting biography evidence for each person in parallel before "
+                "forming a final conclusion.</decision>"
+                "<searches>"
+                "<search>Bruno Soares biography tennis doubles player</search>"
+                "<search>Serena Williams biography tennis singles player</search>"
+                "<search>Roger Federer biography tennis player</search>"
+                "</searches>"
+            ),
+            (
+                "<decision>I should retrieve concise career-summary evidence for all three in parallel to "
+                "simulate a third search round.</decision>"
+                "<searches>"
+                "<search>Bruno Soares career tennis summary</search>"
+                "<search>Serena Williams career tennis summary</search>"
+                "<search>Roger Federer career tennis summary</search>"
+                "</searches>"
+            ),
+        ],
+    },
 }
 
 
@@ -142,7 +175,17 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional path to save the per-turn prompt statistics as JSON.",
     )
+    parser.add_argument(
+        "--save-final-prompt",
+        default=None,
+        help="Optional path to save the final full prompt as a txt file. Defaults to debug/final_prompt_<scenario>.txt",
+    )
     return parser.parse_args()
+
+
+def default_output_path(filename: str) -> str:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(script_dir, filename)
 
 
 def truncate_by_tokens(tokenizer, text: str, max_tokens: int) -> str:
@@ -196,16 +239,19 @@ def format_information_block(
     retrieval_results: List[List[dict]],
     max_obs_length: int,
 ) -> str:
-    truncated_results = [
-        truncate_by_tokens(tokenizer, passages_to_string(result), max_obs_length)
-        for result in retrieval_results
-    ]
+    if tokenizer is None:
+        formatted_results = [passages_to_string(result).strip() for result in retrieval_results]
+    else:
+        formatted_results = [
+            truncate_by_tokens(tokenizer, passages_to_string(result), max_obs_length)
+            for result in retrieval_results
+        ]
 
     if len(queries) == 1:
-        return truncated_results[0]
+        return formatted_results[0]
 
     sections = []
-    for idx, (query, result_text) in enumerate(zip(queries, truncated_results), start=1):
+    for idx, (query, result_text) in enumerate(zip(queries, formatted_results), start=1):
         sections.append(f"[Search {idx}] Query: {query}\n{result_text}".strip())
     return "\n\n".join(sections).strip()
 
@@ -234,7 +280,9 @@ def simulate_scenario(
         if info_text:
             current_prompt += f"\n\n<information>{info_text}</information>\n\n"
 
-        token_len = tokenizer(current_prompt, add_special_tokens=False, return_tensors="pt")["input_ids"].shape[1]
+        token_len = None
+        if tokenizer is not None:
+            token_len = tokenizer(current_prompt, add_special_tokens=False, return_tensors="pt")["input_ids"].shape[1]
         turn_results.append(
             TurnResult(
                 turn_idx=turn_idx,
@@ -254,10 +302,9 @@ def main() -> None:
     args = parse_args()
     scenario = SCENARIOS[args.scenario]
 
-    if not args.tokenizer:
-        raise ValueError("Please pass --tokenizer, for example your BASE_MODEL path.")
-
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
+    tokenizer = None
+    if args.tokenizer:
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
     turn_results = simulate_scenario(
         tokenizer=tokenizer,
         search_url=args.search_url,
@@ -271,7 +318,11 @@ def main() -> None:
     print(f"Question: {scenario['question']}")
     print(f"Search URL: {args.search_url}")
     print(f"Top-k: {args.topk}")
-    print(f"Per-search max observation tokens: {args.max_obs_length}")
+    if tokenizer is None:
+        print("Tokenizer: not provided, using raw retrieval text without token truncation")
+    else:
+        print(f"Tokenizer: {args.tokenizer}")
+        print(f"Per-search max observation tokens: {args.max_obs_length}")
     print()
 
     serializable = []
@@ -282,11 +333,13 @@ def main() -> None:
         print()
         print(f"Queries ({len(item.queries)}): {item.queries}")
         print(f"Prompt chars: {item.char_len}")
-        print(f"Prompt tokens: {item.token_len}")
+        if item.token_len is not None:
+            print(f"Prompt tokens: {item.token_len}")
         if item.info_text:
-            info_tokens = tokenizer(item.info_text, add_special_tokens=False, return_tensors="pt")["input_ids"].shape[1]
             print(f"Information chars: {len(item.info_text)}")
-            print(f"Information tokens: {info_tokens}")
+            if tokenizer is not None:
+                info_tokens = tokenizer(item.info_text, add_special_tokens=False, return_tensors="pt")["input_ids"].shape[1]
+                print(f"Information tokens: {info_tokens}")
         if args.show_full_prompt:
             print()
             print("Full prompt:")
@@ -321,6 +374,12 @@ def main() -> None:
                 indent=2,
             )
         print(f"Saved JSON report to {args.save_json}")
+
+    final_prompt_path = args.save_final_prompt or default_output_path(f"final_prompt_{args.scenario}.txt")
+    if turn_results:
+        with open(final_prompt_path, "w", encoding="utf-8") as f:
+            f.write(turn_results[-1].prompt_text)
+        print(f"Saved final prompt to {final_prompt_path}")
 
 
 if __name__ == "__main__":

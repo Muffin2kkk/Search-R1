@@ -1,16 +1,28 @@
 import copy
 import json
 import re
+import sys
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
 
 try:
     from .strong_model_client import GenerationRequest, GenerationResult, StrongModelClient
 except ImportError:
     from strong_model_client import GenerationRequest, GenerationResult, StrongModelClient
+
+from search_r1.llm_agent.search_observation_utils import (
+    format_search_observation,
+    passages_to_string,
+    truncate_search_result,
+)
 
 
 INVALID_ACTION_OBSERVATION = (
@@ -21,8 +33,6 @@ INVALID_ACTION_OBSERVATION = (
     "and </answer>. Let me try again."
 )
 
-MAX_TAIL_CHARS = 4000
-
 ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
 SEARCHES_RE = re.compile(r"<searches>(.*?)</searches>", re.IGNORECASE | re.DOTALL)
 SEARCH_RE = re.compile(r"<search>(.*?)</search>", re.IGNORECASE | re.DOTALL)
@@ -32,10 +42,13 @@ SEARCH_RE = re.compile(r"<search>(.*?)</search>", re.IGNORECASE | re.DOTALL)
 class CollectorConfig:
     search_url: str
     topk: int = 3
-    max_turns: int = 2
+    max_turns: int = 3
     llm_concurrency: int = 8
     retrieval_timeout: int = 60
     cache_size: int = 10000
+    tokenizer: Any = None
+    max_prompt_length: int = 6144
+    max_obs_length: int = 500
     final_answer_prompt: str = (
         "You have reached the maximum number of search turns. Based on the available "
         "information, provide your final answer in <answer> and </answer>."
@@ -62,6 +75,7 @@ class SampleState:
     search_turn_count: int = 0
     invalid_action_count: int = 0
     usage: List[Dict[str, Any]] = field(default_factory=list)
+    prompt_token_len: Optional[int] = None
 
 
 def clone_messages(messages: Sequence[Dict[str, Any]]) -> List[Dict[str, str]]:
@@ -205,7 +219,8 @@ class StrongRolloutCollector:
         return SampleState(
             sample_id=sample_id,
             source_row=copy.deepcopy(row),
-            messages=prompt_messages,
+            messages=self._truncate_messages_to_budget(prompt_messages),
+            prompt_token_len=self._count_message_tokens(self._truncate_messages_to_budget(prompt_messages)),
         )
 
     def _get_sample_id(self, row: Dict[str, Any], split: str, idx: int) -> str:
@@ -214,6 +229,12 @@ class StrongRolloutCollector:
         return f"{split}-{source_idx}"
 
     def _run_generation_step(self, active_states: List[SampleState]) -> None:
+        for state in active_states:
+            state.messages = self._truncate_messages_to_budget(state.messages)
+            state.prompt_token_len = self._merge_token_len(
+                state.prompt_token_len,
+                self._count_message_tokens(state.messages),
+            )
         requests_list = [
             GenerationRequest(sample_id=state.sample_id, messages=state.messages)
             for state in active_states
@@ -277,13 +298,14 @@ class StrongRolloutCollector:
         results_by_query = self.retrieval_client.get_many(all_queries)
 
         for state, queries in search_jobs:
-            info_text = self._format_parallel_search_observation(queries, results_by_query)
+            info_text, obs_token_len = self._format_parallel_search_observation(queries, results_by_query)
             state.search_turn_count += 1
             state.rollout_turns.append(
                 {
                     "type": "retrieval",
                     "queries": queries,
                     "text": info_text,
+                    "obs_token_len": obs_token_len,
                 }
             )
             state.messages.append(build_info_message(info_text))
@@ -291,6 +313,11 @@ class StrongRolloutCollector:
     def _force_final_answer(self, active_states: List[SampleState]) -> None:
         for state in active_states:
             state.messages.append({"role": "user", "content": self.config.final_answer_prompt})
+            state.messages = self._truncate_messages_to_budget(state.messages)
+            state.prompt_token_len = self._merge_token_len(
+                state.prompt_token_len,
+                self._count_message_tokens(state.messages),
+            )
 
         requests_list = [
             GenerationRequest(sample_id=state.sample_id, messages=state.messages)
@@ -322,29 +349,93 @@ class StrongRolloutCollector:
         self,
         queries: List[str],
         results_by_query: Dict[str, List[Dict[str, Any]]],
-    ) -> str:
-        sections: List[str] = []
-        for idx, query in enumerate(queries, start=1):
-            retrieval_result = results_by_query.get(query, [])
-            sections.append(f"[Search {idx}] Query: {query}\n{self._passages_to_string(retrieval_result)}".strip())
-        joined = "\n\n".join(section for section in sections if section.strip())
-        return joined[:MAX_TAIL_CHARS].strip()
+    ) -> Tuple[str, List[Optional[int]]]:
+        formatted_results = [
+            truncate_search_result(
+                self.config.tokenizer,
+                passages_to_string(results_by_query.get(query, [])),
+                self.config.max_obs_length,
+            )
+            for query in queries
+        ]
+        obs_token_len = [self._count_text_tokens(result_text) for result_text in formatted_results]
+        return format_search_observation(queries, formatted_results), obs_token_len
 
-    def _passages_to_string(self, retrieval_result: List[Dict[str, Any]]) -> str:
-        lines: List[str] = []
-        for idx, doc_item in enumerate(retrieval_result, start=1):
-            document = doc_item.get("document", {}) if isinstance(doc_item, dict) else {}
-            content = str(document.get("contents", "")).strip()
-            if not content:
-                continue
-            title = content.split("\n")[0].strip()
-            text = "\n".join(content.split("\n")[1:]).strip()
-            score = doc_item.get("score")
-            prefix = f"Doc {idx}"
-            if score is not None:
-                prefix += f" (score: {score:.4f})"
-            lines.append(f"{prefix} (Title: {title}) {text}".strip())
-        return "\n".join(lines).strip()
+    def _count_text_tokens(self, text: str) -> Optional[int]:
+        tokenizer = self.config.tokenizer
+        if tokenizer is None:
+            return None
+        return int(
+            tokenizer(text, add_special_tokens=False, return_tensors="pt")["input_ids"][0].shape[0]
+        )
+
+    def _render_messages(self, messages: List[Dict[str, str]]) -> List[int]:
+        tokenizer = self.config.tokenizer
+        if tokenizer is not None and getattr(tokenizer, "chat_template", None):
+            return tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+
+        fallback_text = "\n".join(
+            f"{message.get('role', 'user')}: {message.get('content', '')}" for message in messages
+        )
+        return tokenizer(fallback_text, add_special_tokens=False)["input_ids"] if tokenizer is not None else []
+
+    def _truncate_messages_to_budget(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        tokenizer = self.config.tokenizer
+        if tokenizer is None or not messages:
+            return messages
+
+        truncated_messages = [copy.deepcopy(message) for message in messages]
+        max_prompt_length = self.config.max_prompt_length
+        if len(self._render_messages(truncated_messages)) <= max_prompt_length:
+            return truncated_messages
+
+        while len(truncated_messages) > 1 and len(self._render_messages(truncated_messages)) > max_prompt_length:
+            truncated_messages.pop(0)
+
+        if len(self._render_messages(truncated_messages)) <= max_prompt_length:
+            return truncated_messages
+
+        first_message = copy.deepcopy(truncated_messages[0])
+        content_ids = tokenizer(
+            first_message.get("content", ""),
+            add_special_tokens=False,
+            return_tensors="pt",
+        )["input_ids"][0]
+
+        low, high = 0, content_ids.shape[0]
+        best_content = ""
+        while low <= high:
+            mid = (low + high) // 2
+            candidate_content = tokenizer.decode(content_ids[-mid:], skip_special_tokens=True).strip() if mid > 0 else ""
+            trial_messages = [copy.deepcopy(message) for message in truncated_messages]
+            trial_messages[0]["content"] = candidate_content
+            if len(self._render_messages(trial_messages)) <= max_prompt_length:
+                best_content = candidate_content
+                low = mid + 1
+            else:
+                high = mid - 1
+
+        truncated_messages[0]["content"] = best_content
+        while len(truncated_messages) > 1 and not truncated_messages[0].get("content", "").strip():
+            truncated_messages.pop(0)
+        return truncated_messages
+
+    def _count_message_tokens(self, messages: List[Dict[str, str]]) -> Optional[int]:
+        tokenizer = self.config.tokenizer
+        if tokenizer is None:
+            return None
+        return len(self._render_messages(messages))
+
+    def _merge_token_len(self, current: Optional[int], candidate: Optional[int]) -> Optional[int]:
+        if candidate is None:
+            return current
+        if current is None:
+            return candidate
+        return max(current, candidate)
 
     def _serialize_state(self, state: SampleState) -> Dict[str, Any]:
         row = copy.deepcopy(state.source_row)
@@ -358,6 +449,7 @@ class StrongRolloutCollector:
         row["search_turn_count"] = state.search_turn_count
         row["invalid_action_count"] = state.invalid_action_count
         row["strong_model_usage"] = state.usage
+        row["prompt_token_len"] = state.prompt_token_len
         return row
 
 

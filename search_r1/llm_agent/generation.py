@@ -9,6 +9,11 @@ from verl import DataProto
 from verl.utils.tracking import Tracking
 import shutil
 import requests
+from .search_observation_utils import (
+    format_search_observation,
+    passages_to_string,
+    truncate_search_result,
+)
 
 SEARCHES_RE = re.compile(r'<searches>(.*?)</searches>', re.DOTALL)
 SEARCH_RE = re.compile(r'<search>(.*?)</search>', re.DOTALL)
@@ -415,7 +420,7 @@ class LLMGenerationManager:
                 elif action == 'search':
                     queries = contents[i]
                     query_results = [search_results.pop(0) for _ in queries]
-                    formatted_observation = self._format_search_observation(queries, query_results)
+                    formatted_observation = format_search_observation(queries, query_results)
                     next_obs.append(f'\n\n<information>{formatted_observation}</information>\n\n')
                     dones.append(0)
                     valid_action.append(1)
@@ -469,7 +474,10 @@ If I want to give the final answer, I should put the answer between <answer> and
         """
         results = self._batch_search(queries)['result']
         
-        return [self._truncate_search_result(self._passages2string(result)) for result in results]
+        return [
+            truncate_search_result(self.tokenizer, passages_to_string(result), self.config.max_obs_length)
+            for result in results
+        ]
 
     def _batch_search(self, queries):
         
@@ -480,17 +488,6 @@ If I want to give the final answer, I should put the answer between <answer> and
         }
         
         return requests.post(self.config.search_url, json=payload).json()
-
-    def _passages2string(self, retrieval_result):
-        format_reference = ''
-        for idx, doc_item in enumerate(retrieval_result):
-            
-            content = doc_item['document']['contents']
-            title = content.split("\n")[0]
-            text = "\n".join(content.split("\n")[1:])
-            format_reference += f"Doc {idx+1}(Title: {title}) {text}\n"
-
-        return format_reference
 
     def _extract_first_action_block(self, response: str) -> str:
         candidates = []
@@ -541,25 +538,3 @@ If I want to give the final answer, I should put the answer between <answer> and
         answer = match.group(1).strip()
         return 'answer', answer
 
-    def _truncate_search_result(self, result: str) -> str:
-        result_ids = self.tokenizer(
-            result,
-            return_tensors='pt',
-            add_special_tokens=False,
-        )['input_ids'][0]
-        if result_ids.shape[0] <= self.config.max_obs_length:
-            return result.strip()
-
-        truncated_ids = result_ids[:self.config.max_obs_length]
-        return self.tokenizer.decode(truncated_ids, skip_special_tokens=True).strip()
-
-    def _format_search_observation(self, queries: List[str], query_results: List[str]) -> str:
-        if len(queries) == 1:
-            return query_results[0].strip()
-
-        sections = []
-        for idx, (query, result) in enumerate(zip(queries, query_results), start=1):
-            section = f"[Search {idx}] Query: {query}\n{result.strip()}".strip()
-            sections.append(section)
-
-        return "\n\n".join(sections).strip()

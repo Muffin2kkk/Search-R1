@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple
 
 from datasets import Dataset, load_dataset
+from transformers import AutoTokenizer
 
 try:
     from .strong_model_client import StrongModelClient, is_likely_balance_error
@@ -57,7 +58,7 @@ def parse_args():
     parser.add_argument(
         "--max_turns",
         type=int,
-        default=2,
+        default=3,
         help="Maximum number of search turns before forcing a final answer.",
     )
     parser.add_argument(
@@ -83,6 +84,24 @@ def parse_args():
         type=int,
         default=10000,
         help="Simple LRU cache size for repeated retrieval queries.",
+    )
+    parser.add_argument(
+        "--tokenizer_path",
+        type=str,
+        default=None,
+        help="Tokenizer used to enforce prompt and observation token budgets.",
+    )
+    parser.add_argument(
+        "--max_prompt_length",
+        type=int,
+        default=6144,
+        help="Max serialized prompt/message tokens kept before each LLM call.",
+    )
+    parser.add_argument(
+        "--max_obs_length",
+        type=int,
+        default=500,
+        help="Max tokens kept for each query's retrieval text.",
     )
     parser.add_argument(
         "--llm_api_base",
@@ -319,6 +338,9 @@ def process_split(split: str, args, collector: StrongRolloutCollector) -> None:
 
 def main():
     args = parse_args()
+    tokenizer = None
+    if args.tokenizer_path:
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
 
     model_client = StrongModelClient.from_args(args)
     collector_config = CollectorConfig(
@@ -328,6 +350,9 @@ def main():
         llm_concurrency=args.llm_concurrency,
         retrieval_timeout=args.retrieval_timeout,
         cache_size=args.retrieval_cache_size,
+        tokenizer=tokenizer,
+        max_prompt_length=args.max_prompt_length,
+        max_obs_length=args.max_obs_length,
     )
     collector = StrongRolloutCollector(model_client=model_client, config=collector_config)
 

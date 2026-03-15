@@ -22,7 +22,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.train_batch_size=4 \
     data.val_batch_size=4 \
     data.inference_batch_size=$INFERENCE_BATCH_SIZE \
-    data.max_prompt_length=4096 \
+    data.max_prompt_length=6144 \
     data.max_response_length=500 \
     data.max_start_length=2048 \
     data.max_obs_length=500 \
@@ -55,7 +55,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +trainer.val_before_train=false \
     trainer.rollouts_dir=$ROLLOUTS_DIR \
     trainer.default_local_dir=verl_checkpoints/$EXPERIMENT_NAME \
-    max_turns=2 \
+    max_turns=3 \
     retriever.url="http://127.0.0.1:8000/retrieve" \
     retriever.topk=3 \
     2>&1 | tee $EXPERIMENT_NAME.log
